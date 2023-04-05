@@ -1,17 +1,18 @@
-mod uinput;
+pub mod input_device;
+pub mod input_device_pool;
+pub mod uinput;
 
 use std::{
-    os::unix::prelude::FileTypeExt,
-    path::{Path, PathBuf},
+    io::{BufRead, ErrorKind, StdinLock},
+    os::{fd::AsRawFd, unix::prelude::FileTypeExt},
 };
 
-use evdev_rs::{
-    enums::{EventCode, EV_ABS},
-    DeviceWrapper, ReadFlag,
-};
-use mio::{unix::SourceFd, Events, Interest, Poll, Registry, Token};
+use clap::Command;
+use evdev_rs::enums::{EventCode, EV_ABS};
+use input_device_pool::InputDevicePool;
+use mio::{unix::SourceFd, Events, Interest, Poll, Token};
 use udev::{MonitorBuilder, MonitorSocket};
-use uinput::UInputMouse;
+use uinput::VMouseManager;
 
 fn process_udev_events(
     socket: &MonitorSocket,
@@ -44,218 +45,6 @@ fn process_udev_events(
     Ok(())
 }
 
-struct InputDevice {
-    path: PathBuf,
-    device: evdev_rs::Device,
-}
-
-impl InputDevice {
-    pub fn new(path: PathBuf) -> Result<Self, std::io::Error> {
-        let device = evdev_rs::Device::new_from_path(&path)?;
-        if let Some(n) = device.name() {
-            println!(
-                "Connected to device: '{}' ({:04x}:{:04x})",
-                n,
-                device.vendor_id(),
-                device.product_id()
-            );
-        }
-        Ok(Self { path, device })
-    }
-
-    fn as_raw_fd(&self) -> std::os::fd::RawFd {
-        use std::os::fd::AsRawFd;
-
-        let evdev_ctx = self.device.raw();
-        unsafe { evdev_sys::libevdev_get_fd(evdev_ctx) }.as_raw_fd()
-    }
-
-    fn next_event(&self) -> Result<Option<evdev_rs::InputEvent>, std::io::Error> {
-        // TODO: take care of EAGAIN
-        let next_event = self
-            .device
-            .next_event(ReadFlag::NORMAL | ReadFlag::BLOCKING);
-
-        match next_event {
-            Ok((_success, event)) => Ok(Some(event)),
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
-            Err(err) => Err(err),
-        }
-    }
-}
-
-impl mio::event::Source for InputDevice {
-    fn register(
-        &mut self,
-        registry: &Registry,
-        token: Token,
-        interests: Interest,
-    ) -> std::io::Result<()> {
-        SourceFd(&self.as_raw_fd()).register(registry, token, interests)
-    }
-
-    fn reregister(
-        &mut self,
-        registry: &Registry,
-        token: Token,
-        interests: Interest,
-    ) -> std::io::Result<()> {
-        SourceFd(&self.as_raw_fd()).reregister(registry, token, interests)
-    }
-
-    fn deregister(&mut self, registry: &Registry) -> std::io::Result<()> {
-        SourceFd(&self.as_raw_fd()).deregister(registry)
-    }
-}
-
-struct InputDevicePool {
-    token_start: usize,
-    devices: Vec<InputDevice>,
-}
-
-impl InputDevicePool {
-    pub fn new(token_start: usize) -> Self {
-        Self {
-            token_start,
-            devices: Vec::new(),
-        }
-    }
-
-    fn as_token(&self, index: usize) -> Token {
-        Token(self.token_start + index)
-    }
-
-    fn index_from_token(&self, Token(tok): Token) -> usize {
-        tok - self.token_start
-    }
-
-    fn next_free_token(&self) -> Token {
-        self.as_token(self.devices.len())
-    }
-
-    fn contains(&self, token: Token) -> bool {
-        self.index_from_token(token) < self.devices.len()
-    }
-    fn get(&self, token: Token) -> Option<&InputDevice> {
-        self.devices.get(self.index_from_token(token))
-    }
-
-    pub fn insert_from_path(
-        &mut self,
-        poll: &mut Poll,
-        path: PathBuf,
-    ) -> Result<(), std::io::Error> {
-        let device = InputDevice::new(path)?;
-        let token = self.next_free_token();
-        self.devices.push(device);
-        poll.registry().register(
-            self.devices.last_mut().unwrap(),
-            token,
-            Interest::WRITABLE | Interest::READABLE,
-        )?;
-        Ok(())
-    }
-
-    fn delete_from_path(&mut self, poll: &mut Poll, path: &Path) -> Result<(), std::io::Error> {
-        for (i, device) in self.devices.iter().enumerate() {
-            if device.path == path {
-                return self.delete(poll, i);
-            }
-        }
-
-        // NOT FOUND
-        eprintln!("path not found in Input device Pool");
-        Ok(())
-    }
-
-    // CRASH ON OOB
-    fn delete(&mut self, poll: &mut Poll, index: usize) -> Result<(), std::io::Error> {
-        let last_index = self.devices.len() - 1;
-        if index != last_index {
-            // Swap index and last
-            self.devices.swap(index, last_index);
-
-            let token = self.as_token(index);
-            poll.registry().reregister(
-                &mut self.devices[index],
-                token,
-                Interest::WRITABLE | Interest::READABLE,
-            )?;
-        }
-
-        poll.registry()
-            .deregister(&mut self.devices.pop().unwrap())?;
-        Ok(())
-    }
-}
-
-struct VMouseManager {
-    vmouse: UInputMouse,
-    ddx: f32,
-    ddy: f32,
-    dx: f32,
-    dy: f32,
-    speed_multiplier: f32,
-    val_x: f32,
-    val_y: f32,
-}
-
-impl VMouseManager {
-    pub fn new(config: MouseConfig) -> Result<Self, std::io::Error> {
-        Ok(Self {
-            vmouse: UInputMouse::new()?,
-            ddx: 0.0,
-            ddy: 0.0,
-            speed_multiplier: config.speed,
-            dx: 0.0,
-            dy: 0.0,
-            val_x: 0.0,
-            val_y: 0.0,
-        })
-    }
-
-    pub fn map_event(&mut self, event: evdev_rs::InputEvent, joystick_config: &JoystickConfig) {
-        let convert = |value: f32| -> f32 {
-            let fcentered = value - joystick_config.offset;
-            let sign = fcentered.signum();
-            let fabs = fcentered.abs();
-
-            let fabs = (fabs - joystick_config.dead_zone)
-                / (joystick_config.max - joystick_config.dead_zone);
-
-            sign * fabs.clamp(0.0, 1.0)
-        };
-        match event.event_code {
-            EventCode::EV_ABS(EV_ABS::ABS_X) => self.val_x = event.value as f32,
-            EventCode::EV_ABS(EV_ABS::ABS_Y) => self.val_y = event.value as f32,
-            _ => (),
-        }
-
-        let (sin, cos) = f32::sin_cos(std::f32::consts::PI / 180. * joystick_config.angle);
-        self.ddx = convert(self.val_x * cos + self.val_y * sin);
-        self.ddy = convert(-self.val_x * sin + self.val_y * cos);
-    }
-
-    fn send_event(&mut self, dt: f32) -> Result<(), std::io::Error> {
-        self.dx += dt * self.speed_multiplier * self.ddx;
-        self.dy += dt * self.speed_multiplier * self.ddy;
-
-        // println!("Move mouse with {dt} {} {}", self.ddx, self.ddy);
-        if self.dx.abs() >= 1.0 {
-            let dx = self.dx as i32;
-            self.vmouse.move_mouse_x(dx)?;
-            self.dx -= dx as f32;
-        }
-
-        if self.dy.abs() >= 1.0 {
-            let dy = self.dy as i32;
-            self.vmouse.move_mouse_y(dy)?;
-            self.dy -= dy as f32;
-        }
-        Ok(())
-    }
-}
-
 fn populate_from_dev_input(
     input_device_pool: &mut InputDevicePool,
     poll: &mut Poll,
@@ -278,12 +67,12 @@ struct Config {
 }
 
 #[derive(serde::Deserialize)]
-struct MouseConfig {
+pub struct MouseConfig {
     speed: f32,
 }
 
 #[derive(serde::Deserialize)]
-struct JoystickConfig {
+pub struct JoystickConfig {
     pub dead_zone: f32,
     pub max: f32,
     pub offset: f32,
@@ -313,7 +102,29 @@ fn read_config() -> Result<Config, Box<dyn std::error::Error>> {
     Ok(res)
 }
 
-fn main() {
+fn setup_udev(poll: &mut Poll, tok: usize) -> Result<MonitorSocket, std::io::Error> {
+    let mut socket = MonitorBuilder::new()?.match_subsystem("input")?.listen()?;
+
+    poll.registry().register(
+        &mut socket,
+        mio::Token(tok),
+        Interest::WRITABLE | Interest::READABLE,
+    )?;
+
+    Ok(socket)
+}
+
+fn setup_stdin<'a, 'b>(poll: &'a mut Poll, tok: usize) -> Result<StdinLock<'b>, std::io::Error> {
+    let stdin = std::io::stdin().lock();
+    poll.registry().register(
+        &mut SourceFd(&stdin.as_raw_fd()),
+        mio::Token(tok),
+        Interest::READABLE,
+    )?;
+    Ok(stdin)
+}
+
+fn run() {
     let config = match read_config() {
         Ok(ok) => ok,
         Err(err) => {
@@ -321,22 +132,11 @@ fn main() {
             Default::default()
         }
     };
+
     let mut poll = Poll::new().expect("Can't create Poll");
     let mut events = Events::with_capacity(1024);
 
-    let mut udev_socket = MonitorBuilder::new()
-        .expect("Can't get a UDEV monitor")
-        .match_subsystem("input")
-        .expect("Could not match input subsystem")
-        .listen()
-        .expect("Could not listen");
-    poll.registry()
-        .register(
-            &mut udev_socket,
-            mio::Token(0),
-            Interest::WRITABLE | Interest::READABLE,
-        )
-        .expect("Could not register udev socket for polling");
+    let udev_socket = setup_udev(&mut poll, 0).expect("Could not setup udev for polling");
 
     let mut input_device_pool = InputDevicePool::new(1);
     populate_from_dev_input(&mut input_device_pool, &mut poll).expect("Can't populate");
@@ -350,8 +150,11 @@ fn main() {
         last = now;
 
         // NOTE: poll rate is 100HZ, maybe not the best ?
-        poll.poll(&mut events, Some(std::time::Duration::from_millis(10)))
-            .expect("Could not poll");
+        match poll.poll(&mut events, Some(std::time::Duration::from_millis(10))) {
+            Ok(_) => (),
+            Err(err) if err.kind() == ErrorKind::Interrupted => (),
+            err => err.expect("Error while polling"),
+        }
 
         for event in &events {
             match event.token() {
@@ -384,5 +187,112 @@ fn main() {
         vmouse_manager
             .send_event(dt)
             .expect("Error while trying to send mouse movement");
+    }
+}
+
+fn calibrate() {
+    let mut poll = Poll::new().expect("Can't create Poll");
+    let mut events = Events::with_capacity(1024);
+
+    let udev_socket = setup_udev(&mut poll, 0).expect("Could not setup udev");
+    let mut stdin = setup_stdin(&mut poll, 1).expect("Could not register stdin for polling");
+
+    let mut input_device_pool = InputDevicePool::new(2);
+    populate_from_dev_input(&mut input_device_pool, &mut poll).expect("Can't populate");
+
+    let mut max_x = f32::NEG_INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    let mut min_x = f32::INFINITY;
+    let mut min_y = f32::INFINITY;
+
+    println!("Enter q to exit");
+    'poll_loop: loop {
+        poll.poll(&mut events, None).expect("Could not poll");
+
+        for event in &events {
+            match event.token() {
+                Token(0) => process_udev_events(&udev_socket, &mut poll, &mut input_device_pool)
+                    .expect("Error while processing udev events"),
+                Token(1) => loop {
+                    let mut buf = String::new();
+                    if stdin.read_line(&mut buf).is_ok() {
+                        if let Some('q') = buf.chars().next() {
+                            break 'poll_loop;
+                        }
+                    } else {
+                        break;
+                    }
+                },
+                token if input_device_pool.contains(token) => {
+                    let Some(device) = input_device_pool.get(token) else {break;};
+                    loop {
+                        let event = device.next_event();
+
+                        match event {
+                            Err(err) => {
+                                eprintln!(
+                                    "unexpected error while getting input device next event: {err}"
+                                );
+                            }
+                            Ok(Some(event)) => {
+                                match event.event_code {
+                                    EventCode::EV_ABS(EV_ABS::ABS_X) => {
+                                        let new_max_x = max_x.max(event.value as f32);
+                                        let new_min_x = min_x.min(event.value as f32);
+
+                                        if new_max_x > max_x {
+                                            println!("NEW MAX_X VALUE: {new_max_x}");
+                                            max_x = new_max_x;
+                                        }
+                                        if new_min_x < min_x {
+                                            println!("NEW MAX_X VALUE: {new_max_x}");
+                                            min_x = new_min_x;
+                                        }
+                                    }
+                                    EventCode::EV_ABS(EV_ABS::ABS_Y) => {
+                                        let new_max_y = max_y.max(event.value as f32);
+                                        let new_min_y = min_y.min(event.value as f32);
+
+                                        if new_max_y > max_y {
+                                            println!("NEW MAX_Y VALUE: {new_max_y}");
+                                            max_y = new_max_y;
+                                        }
+                                        if new_min_y < min_y {
+                                            println!("NEW MAX_Y VALUE: {new_max_y}");
+                                            min_y = new_min_y;
+                                        }
+                                    }
+                                    _ => (),
+                                }
+                                continue;
+                            }
+                            Ok(None) => (),
+                        }
+                        break;
+                    }
+                }
+                _ => eprintln!("Unknown poll token"),
+            };
+        }
+    }
+
+    println!("----------------");
+    println!("X: max: {max_x}, min: {min_x}");
+    println!("Y: max: {max_y}, min: {min_y}");
+}
+
+fn main() {
+    let args = Command::new("hid")
+        .subcommand_required(true)
+        .arg_required_else_help(true)
+        .subcommand(Command::new("run").about("Run the damn thing"))
+        .subcommand(Command::new("calibrate").about("calibrate a joystick"));
+
+    let matches = args.get_matches();
+
+    match matches.subcommand() {
+        Some(("run", _)) => run(),
+        Some(("calibrate", _)) => calibrate(),
+        _ => unreachable!(),
     }
 }
