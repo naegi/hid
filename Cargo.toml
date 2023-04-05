@@ -9,6 +9,6 @@ edition = "2021"
 evdev-rs = "0.6.1"
 evdev-sys = "0.2.5"
 mio = "0.8.6"
-serde = "1.0.159"
+serde = { version = "1.0.159", features = ["serde_derive"] }
 serde_json = "1.0.95"
 udev = { version = "0.7.0", features = ["mio"] }

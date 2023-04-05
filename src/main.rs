@@ -187,10 +187,6 @@ impl InputDevicePool {
             .deregister(&mut self.devices.pop().unwrap())?;
         Ok(())
     }
-
-    fn delete_from_token(&mut self, poll: &mut Poll, token: Token) -> Result<(), std::io::Error> {
-        self.delete(poll, self.index_from_token(token))
-    }
 }
 
 struct VMouseManager {
@@ -200,40 +196,44 @@ struct VMouseManager {
     dx: f32,
     dy: f32,
     speed_multiplier: f32,
+    val_x: f32,
+    val_y: f32,
 }
 
 impl VMouseManager {
-    pub fn new() -> Result<Self, std::io::Error> {
+    pub fn new(config: MouseConfig) -> Result<Self, std::io::Error> {
         Ok(Self {
             vmouse: UInputMouse::new()?,
             ddx: 0.0,
             ddy: 0.0,
-            speed_multiplier: 500.0,
+            speed_multiplier: config.speed,
             dx: 0.0,
             dy: 0.0,
+            val_x: 0.0,
+            val_y: 0.0,
         })
     }
 
-    pub fn map_event(&mut self, event: evdev_rs::InputEvent) {
-        fn convert(value: i32, dead_zone: i32, offset: i32, max: i32) -> f32 {
-            let fval = value as f32;
-            let foffset = offset as f32;
-            let fdeadzone = dead_zone as f32;
-            let fmax = max as f32;
-
-            let fcentered = fval - foffset;
+    pub fn map_event(&mut self, event: evdev_rs::InputEvent, joystick_config: &JoystickConfig) {
+        let convert = |value: f32| -> f32 {
+            let fcentered = value - joystick_config.offset;
             let sign = fcentered.signum();
             let fabs = fcentered.abs();
 
-            let fabs = (fabs - fdeadzone) / (fmax - fdeadzone);
+            let fabs = (fabs - joystick_config.dead_zone)
+                / (joystick_config.max - joystick_config.dead_zone);
 
             sign * fabs.clamp(0.0, 1.0)
-        }
+        };
         match event.event_code {
-            EventCode::EV_ABS(EV_ABS::ABS_X) => self.ddx = convert(event.value, 2000, 0, 35000),
-            EventCode::EV_ABS(EV_ABS::ABS_Y) => self.ddy = convert(event.value, 2000, 0, 35000),
+            EventCode::EV_ABS(EV_ABS::ABS_X) => self.val_x = event.value as f32,
+            EventCode::EV_ABS(EV_ABS::ABS_Y) => self.val_y = event.value as f32,
             _ => (),
         }
+
+        let (sin, cos) = f32::sin_cos(std::f32::consts::PI / 180. * joystick_config.angle);
+        self.ddx = convert(self.val_x * cos + self.val_y * sin);
+        self.ddy = convert(-self.val_x * sin + self.val_y * cos);
     }
 
     fn send_event(&mut self, dt: f32) -> Result<(), std::io::Error> {
@@ -271,7 +271,56 @@ fn populate_from_dev_input(
     Ok(())
 }
 
+#[derive(serde::Deserialize)]
+struct Config {
+    mouse: MouseConfig,
+    joystick: JoystickConfig,
+}
+
+#[derive(serde::Deserialize)]
+struct MouseConfig {
+    speed: f32,
+}
+
+#[derive(serde::Deserialize)]
+struct JoystickConfig {
+    pub dead_zone: f32,
+    pub max: f32,
+    pub offset: f32,
+    pub angle: f32,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            mouse: MouseConfig { speed: 700.0 },
+            joystick: JoystickConfig {
+                dead_zone: 0.0,
+                max: i16::MAX as f32,
+                offset: 0.0,
+                angle: 0.0,
+            },
+        }
+    }
+}
+
+fn read_config() -> Result<Config, Box<dyn std::error::Error>> {
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(false)
+        .open("config.json")?;
+    let res = serde_json::from_reader(f)?;
+    Ok(res)
+}
+
 fn main() {
+    let config = match read_config() {
+        Ok(ok) => ok,
+        Err(err) => {
+            eprintln!("Error while reading config: {err}");
+            Default::default()
+        }
+    };
     let mut poll = Poll::new().expect("Can't create Poll");
     let mut events = Events::with_capacity(1024);
 
@@ -292,7 +341,7 @@ fn main() {
     let mut input_device_pool = InputDevicePool::new(1);
     populate_from_dev_input(&mut input_device_pool, &mut poll).expect("Can't populate");
 
-    let mut vmouse_manager = VMouseManager::new().expect("Can't create vmouse");
+    let mut vmouse_manager = VMouseManager::new(config.mouse).expect("Can't create vmouse");
 
     let mut last = std::time::Instant::now();
     loop {
@@ -300,6 +349,7 @@ fn main() {
         let dt = (now - last).as_secs_f32();
         last = now;
 
+        // NOTE: poll rate is 100HZ, maybe not the best ?
         poll.poll(&mut events, Some(std::time::Duration::from_millis(10)))
             .expect("Could not poll");
 
@@ -319,7 +369,7 @@ fn main() {
                                 );
                             }
                             Ok(Some(event)) => {
-                                vmouse_manager.map_event(event);
+                                vmouse_manager.map_event(event, &config.joystick);
                                 continue;
                             }
                             Ok(None) => (),

@@ -1,0 +1,11 @@
+{
+  "mouse": {
+    "speed": 900
+  },
+  "joystick": {
+    "dead_zone": 2000,
+    "max": 30000,
+    "offset": 0.0,
+    "angle": -10.0
+  }
+}
